@@ -25,8 +25,9 @@ def _install_jax_device_put_replicated() -> None:
     """Put back jax.device_put_replicated for Brax 0.14 on JAX 0.12+.
 
     JAX removed the function. Brax still uses it to copy the PPO training
-    state onto each local device. This follows JAX's documented replacement:
-    stack one copy per device and shard that new axis.
+    state onto each local device, then reads shard 0 and drops that axis.
+    Keep the stacked array on one device. Sharding the new axis makes the
+    eval rollout fail while creating a cuSolver handle.
     """
     try:
         getattr(jax, "device_put_replicated")
@@ -34,17 +35,16 @@ def _install_jax_device_put_replicated() -> None:
     except AttributeError:
         pass
 
-    import numpy as np
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec
-
     def device_put_replicated(value, devices):
         devices = list(devices)
-        mesh = Mesh(np.array(devices), ("x",))
-        sharding = NamedSharding(mesh, PartitionSpec("x"))
 
         def _put(leaf):
+            # Stack a leading device axis, then place that whole array on the
+            # first device. Brax later takes shard 0 and squeezes axis 0.
+            # A NamedSharding here leaves that axis sharded, and the eval
+            # rollout then fails inside cuSolver.
             stacked = jax.numpy.stack([leaf] * len(devices))
-            return jax.device_put(stacked, sharding)
+            return jax.device_put(stacked, devices[0])
 
         return jax.tree_util.tree_map(_put, value)
 
