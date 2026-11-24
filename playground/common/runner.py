@@ -21,6 +21,36 @@ import jax
 from playground.common.export_onnx import export_onnx
 
 
+def _install_jax_device_put_replicated() -> None:
+    """Put back jax.device_put_replicated for Brax 0.14 on JAX 0.12+.
+
+    JAX removed the function. Brax still uses it to copy the PPO training
+    state onto each local device. This follows JAX's documented replacement:
+    stack one copy per device and shard that new axis.
+    """
+    try:
+        getattr(jax, "device_put_replicated")
+        return
+    except AttributeError:
+        pass
+
+    import numpy as np
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    def device_put_replicated(value, devices):
+        devices = list(devices)
+        mesh = Mesh(np.array(devices), ("x",))
+        sharding = NamedSharding(mesh, PartitionSpec("x"))
+
+        def _put(leaf):
+            stacked = jax.numpy.stack([leaf] * len(devices))
+            return jax.device_put(stacked, sharding)
+
+        return jax.tree_util.tree_map(_put, value)
+
+    jax.device_put_replicated = device_put_replicated
+
+
 class BaseRunner(ABC):
     def __init__(self, args: argparse.Namespace) -> None:
         """Initialize the Runner class.
@@ -84,6 +114,7 @@ class BaseRunner(ABC):
         )
 
     def train(self) -> None:
+        _install_jax_device_put_replicated()
         self.ppo_params = locomotion_params.brax_ppo_config(
             "BerkeleyHumanoidJoystickFlatTerrain"
         )  # TODO
