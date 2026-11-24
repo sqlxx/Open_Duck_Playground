@@ -8,6 +8,43 @@ from abc import ABC
 import argparse
 import functools
 from datetime import datetime
+
+
+def _preload_venv_cuda() -> None:
+    """Load this environment's CUDA libraries before TensorFlow.
+
+    Importing TensorFlow pulls in the system CUDA 12 cuBLAS. JAX's CUDA 13
+    cuSOLVER then fails inside the first eval rollout. Loading the venv copies
+    first keeps the process on one CUDA stack.
+    """
+    import ctypes
+    import importlib.util
+
+    spec = importlib.util.find_spec("nvidia")
+    if spec is None or not spec.submodule_search_locations:
+        return
+    lib_names = (
+        "libnvJitLink.so.13",
+        "libcublas.so.13",
+        "libcublasLt.so.13",
+        "libcusparse.so.12",
+        "libcusolver.so.12",
+        "libcudart.so.13",
+        "libnvrtc.so.13",
+    )
+    for loc in spec.submodule_search_locations:
+        root = Path(loc) / "cu13" / "lib"
+        if not root.is_dir():
+            continue
+        for name in lib_names:
+            path = root / name
+            if path.is_file():
+                ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
+        return
+
+
+_preload_venv_cuda()
+
 from flax.training import orbax_utils
 from tensorboardX import SummaryWriter
 
@@ -19,36 +56,6 @@ from orbax import checkpoint as ocp
 import jax
 
 from playground.common.export_onnx import export_onnx
-
-
-def _install_jax_device_put_replicated() -> None:
-    """Put back jax.device_put_replicated for Brax 0.14 on JAX 0.12+.
-
-    JAX removed the function. Brax still uses it to copy the PPO training
-    state onto each local device, then reads shard 0 and drops that axis.
-    Keep the stacked array on one device. Sharding the new axis makes the
-    eval rollout fail while creating a cuSolver handle.
-    """
-    try:
-        getattr(jax, "device_put_replicated")
-        return
-    except AttributeError:
-        pass
-
-    def device_put_replicated(value, devices):
-        devices = list(devices)
-
-        def _put(leaf):
-            # Stack a leading device axis, then place that whole array on the
-            # first device. Brax later takes shard 0 and squeezes axis 0.
-            # A NamedSharding here leaves that axis sharded, and the eval
-            # rollout then fails inside cuSolver.
-            stacked = jax.numpy.stack([leaf] * len(devices))
-            return jax.device_put(stacked, devices[0])
-
-        return jax.tree_util.tree_map(_put, value)
-
-    jax.device_put_replicated = device_put_replicated
 
 
 class BaseRunner(ABC):
@@ -114,7 +121,6 @@ class BaseRunner(ABC):
         )
 
     def train(self) -> None:
-        _install_jax_device_put_replicated()
         self.ppo_params = locomotion_params.brax_ppo_config(
             "BerkeleyHumanoidJoystickFlatTerrain"
         )  # TODO
